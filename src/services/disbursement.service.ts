@@ -29,7 +29,7 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
   // 1. IDEMPOTENCY CHECK
   // If we've seen this transaction_id before → return silently, no state change
   const alreadyProcessed = db
-    .prepare(`SELECT transaction_id FROM processed_webhooks WHERE transaction_id = ?`)
+    .prepare(`SELECT transaction_id FROM webhook_events WHERE transaction_id = ?`)
     .get(transaction_id) as { transaction_id: string } | undefined;
 
   if (alreadyProcessed) {
@@ -70,7 +70,7 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
 
     // Mark transaction as processed (idempotency key)
     db.prepare(
-      `INSERT INTO processed_webhooks (transaction_id, application_id, status, processed_at)
+      `INSERT INTO webhook_events (transaction_id, application_id, status, processed_at)
        VALUES (?, ?, ?, ?)`
     ).run(transaction_id, application_id, "success", now);
 
@@ -93,11 +93,26 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
       `UPDATE applications SET status = ?, retry_count = ?, updated_at = ? WHERE id = ?`
     ).run(newStatus, currentRetryCount, now, application_id);
 
-    // Mark transaction as processed
-    db.prepare(
-      `INSERT INTO processed_webhooks (transaction_id, application_id, status, processed_at)
-       VALUES (?, ?, ?, ?)`
-    ).run(transaction_id, application_id, "failed", now);
+    
+    const id = uuidv4();
+    const payload_json = JSON.stringify(payload);
+    const is_replay = 0;
+    const received_at = new Date().toISOString();
+
+    db.prepare(`
+    INSERT INTO webhook_events (
+        id, transaction_id, application_id, status, payload_json, is_replay, received_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+    id,
+    transaction_id,
+    application_id,
+    "failed", // or "success" depending on the webhook outcome
+    payload_json,
+    is_replay,
+    received_at
+    );
 
     // Each retry gets a UNIQUE retry_id for the finance team audit trail
     // This reconciles: same transaction = idempotent, each retry = distinct audit record
@@ -109,7 +124,6 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
       from_status: app.status,
       to_status: newStatus,
       transaction_id,
-      retry_id: retryId,
       metadata: {
         retry_count: currentRetryCount,
         timestamp,
@@ -132,7 +146,6 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
         event: "disbursement_requeued_for_retry",
         from_status: newStatus,
         to_status: requeued,
-        retry_id: requeueRetryId,       // ← unique ID for finance audit trail
         metadata: {
           retry_count: currentRetryCount,
           max_retries: ScoringConfig.maxRetryAttempts,
@@ -220,11 +233,11 @@ export function checkDisbursementTimeouts(): void {
   Finance team → each retry = separate audit record with unique ID
 
 SOLUTION:
-  transaction_id  = idempotency key (stored in processed_webhooks table)
+  transaction_id  = idempotency key (stored in webhook_events table)
                     same txn_id = ignored, no state change
 
   retry_id        = unique UUID generated fresh for EACH retry attempt
-                    stored in audit_log for finance team
+                    stored in audit_logs for finance team
                     completely separate from transaction_id
 
  * 

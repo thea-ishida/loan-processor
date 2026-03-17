@@ -35,7 +35,7 @@ export function submitApplication(input: ApplicationInput): Application {
   }
 
   const scoreBreakdown = scoreApplication(input);
-  const decision = getDecisionFromScore(scoreBreakdown.total);
+  const decision = getDecisionFromScore(scoreBreakdown.total, input);
 
   const now = new Date().toISOString();
   const id = uuidv4();
@@ -154,16 +154,13 @@ export function reviewApplication(
 }
 
 
-
-
-
-
 export function queueDisbursement(applicationId: string): void {
   const db = getDb();
   const app = getApplicationById(applicationId);
   if (!app) return;
 
-  const newStatus = transition(app.status, "disbursement_queued");
+  transition(app.status, "disbursement_queued");
+  const newStatus = "approved";
   const now = new Date().toISOString();
 
   db.prepare(
@@ -184,26 +181,24 @@ export function writeAuditLog(params: {
   event: string;
   from_status?: string;
   to_status?: string;
-  retry_id?: string;
+  triggered_by?: string;        // maps to triggered_by column
   transaction_id?: string;
   metadata?: Record<string, unknown>;
 }): void {
   const db = getDb();
   db.prepare(
-    `INSERT INTO audit_log (
-      id, application_id, event, from_status, to_status,
-      retry_id, transaction_id, metadata_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO audit_logs (
+      id, application_id, event_type, from_status, to_status, triggered_by, event_data_json, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
-    uuidv4(),
-    params.application_id,
-    params.event,
-    params.from_status ?? null,
-    params.to_status ?? null,
-    params.retry_id ?? null,
-    params.transaction_id ?? null,
-    JSON.stringify(params.metadata ?? {}),
-    new Date().toISOString()
+    uuidv4(),                                 // id          TEXT PRIMARY KEY
+    params.application_id,                    // application_id TEXT NOT NULL
+    params.event,                             // event_type  TEXT NOT NULL
+    params.from_status ?? null,               // from_status TEXT
+    params.to_status ?? null,                 // to_status   TEXT
+    params.triggered_by ?? "system",          // triggered_by TEXT NOT NULL  ← never null
+    JSON.stringify(params.metadata ?? {}),    // event_data_json TEXT
+    new Date().toISOString()                  // created_at  TEXT NOT NULL
   );
 }
 
@@ -211,7 +206,7 @@ export function getAuditLog(applicationId: string): unknown[] {
   const db = getDb();
   return db
     .prepare(
-      `SELECT * FROM audit_log WHERE application_id = ? ORDER BY created_at ASC`
+      `SELECT * FROM audit_logs WHERE application_id = ? ORDER BY created_at ASC`
     )
     .all(applicationId);
 }

@@ -39,23 +39,51 @@ export function scoreApplication(input: ApplicationInput): ScoreBreakdown {
 // Interpretation: documented income must be within ±10% of stated income
 // i.e. documented must fall in [stated * 0.90, stated * 1.10]
 // If documented_monthly_income is null → cannot verify → score 0
-// ─────────────────────────────────────────────
+
+// Factor 1: Income Verification (30%)
+//
+// TOLERANCE INTERPRETATION — ASYMMETRIC LOWER-BOUND ONLY:
+//
+//   The spec states a "10% tolerance" without specifying direction.
+//   We deliberately chose a one-sided (lower-bound only) interpretation:
+//
+//   PASS:  documented_monthly_income >= stated_monthly_income * (1 - tolerance)
+//   PASS:  documented_monthly_income > stated_monthly_income  ← never penalised
+//   FAIL:  documented_monthly_income < stated_monthly_income * (1 - tolerance)
+//
+//   Rationale:
+//   Applicants routinely understate total income — they quote only their
+//   primary salary and exclude bonuses, freelance, rental income, etc.
+//   So documented income running HIGHER than stated is actually a sign of
+//   conservative self-reporting, not fraud. We should never penalise that.
+//
+//   The only genuinely suspicious signal is documented income coming in
+//   SIGNIFICANTLY LOWER than stated — that suggests the applicant inflated
+//   their income to qualify. The 10% band gives a reasonable buffer for
+//   rounding, pay-period timing differences, and minor discrepancies.
+//
+//   Example outcomes:
+//   - Stated $5,000 / Documented $4,800 → lower bound = $4,500 →  PASS
+//   - Stated $5,000 / Documented $6,500 → above stated    →  PASS (no upper cap)
+//   - Stated $10,000 / Documented $1,400 → lower bound = $9,000 →  FAIL
+//
+//   If documented_monthly_income is null → cannot verify → score 0
+// ─────────────────────────────────────────────────────────────────────────────
 function scoreIncomeVerification(input: ApplicationInput): number {
+  // Cannot verify without documentation
   if (input.documented_monthly_income === null) return 0;
 
-  const stated       = input.stated_monthly_income;
-  const documented   = input.documented_monthly_income;
-  const tolerance    = ScoringConfig.incomeTolerance;
+  const stated     = input.stated_monthly_income;
+  const documented = input.documented_monthly_income;
+  const tolerance  = ScoringConfig.incomeTolerance; // 0.10
 
-  const lowerBound = stated * (1 - tolerance); // stated * 0.90
-  const upperBound = stated * (1 + tolerance); // stated * 1.10
+  // Lower bound: documented must not be more than (tolerance)% below stated
+  const lowerBound = stated * (1 - tolerance); // e.g. $5,000 * 0.90 = $4,500
 
-  if (documented >= lowerBound && documented <= upperBound) {
-    return 100; // within tolerance → full score
-  }
-
-  return 0; // outside tolerance → no score
+  // No upper bound: earning MORE than stated is fine — never penalised
+  return documented >= lowerBound ? 100 : 0;
 }
+
 
 // ─────────────────────────────────────────────
 // Factor 2: Income Level (25%)
@@ -65,18 +93,19 @@ function scoreIncomeVerification(input: ApplicationInput): number {
 function scoreIncomeLevel(input: ApplicationInput): number {
   const ratio = input.stated_monthly_income / input.loan_amount;
 
-  if (ratio >= 3) return 100;  // strong ✅
+  if (ratio >= 3) return 100;  // strong income 
   if (ratio >= 2) return 60;   // borderline
-  if (ratio >= 1) return 30;   // weak
+  if (ratio >= 1) return 30;   // weak income
   return 0;                    // income less than loan amount
 }
 
 // ─────────────────────────────────────────────
 // Factor 3: Account Stability (20%)
-// 3 sub-checks, each worth ~33 points:
+// 3 sub-checks, each worth ~33 points (total 100 if all 3 are good):
 //   - positive ending balance
 //   - no overdrafts
 //   - consistent deposits
+// If all three conditions are met → 100 points, if one or more fail the score drops accordingly (e.g. 2/3 → ~67, 1/3 → ~33, 0/3 → 0)
 // If data is null → treat as failing that check (0 points)
 // ─────────────────────────────────────────────
 function scoreAccountStability(input: ApplicationInput): number {
@@ -102,7 +131,9 @@ function scoreAccountStability(input: ApplicationInput): number {
 
 // ─────────────────────────────────────────────
 // Factor 4: Employment Status (15%)
-// employed > self-employed > unemployed
+// employed = 100 points (reflects stability and regular income)
+// self-employed = 60 points (somewhat less stable, but still good)
+// unemployed = 0 points (no income source)
 // ─────────────────────────────────────────────
 function scoreEmploymentStatus(input: ApplicationInput): number {
   switch (input.employment_status) {
@@ -115,6 +146,7 @@ function scoreEmploymentStatus(input: ApplicationInput): number {
 
 // ─────────────────────────────────────────────
 // Factor 5: Debt-to-Income (10%)
+// Reward applicants with lower ratios of withdrawals to deposits (i.e. less existing debt obligations relative to income)
 // Ratio = monthly_withdrawals / monthly_deposits
 // Lower ratio = better (less existing debt obligations)
 // If data is null → treat as worst case (score 0)
@@ -140,10 +172,23 @@ function scoreDebtToIncome(input: ApplicationInput): number {
 // ─────────────────────────────────────────────
 // Decision: convert total score to status
 // ─────────────────────────────────────────────
-export function getDecisionFromScore(
-  score: number
-): "approved" | "flagged_for_review" | "denied" {
-  if (score >= ScoringConfig.thresholds.autoApprove) return "approved";
-  if (score >= ScoringConfig.thresholds.manualReview) return "flagged_for_review";
-  return "denied";
+export function getDecisionFromScore(score: number, input: ApplicationInput): "approved" | "flagged_for_review" | "denied" {
+  const missingDocs =
+    !input.documented_monthly_income ||
+    input.bank_ending_balance === null ||
+    input.bank_has_overdrafts === null ||
+    input.bank_has_consistent_deposits === null ||
+    input.monthly_withdrawals === null ||
+    input.monthly_deposits === null;
+
+    const incomeMismatch =
+    input.documented_monthly_income &&
+    input.stated_monthly_income / input.documented_monthly_income > 3;
+
+    if (incomeMismatch) return "denied"; // deny for falsified income
+
+    if (score >= ScoringConfig.thresholds.autoApprove) return "approved";
+    if (missingDocs) return "flagged_for_review"; // override for missing docs
+    if (score >= ScoringConfig.thresholds.manualReview) return "flagged_for_review";
+    return "denied";
 }
