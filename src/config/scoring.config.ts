@@ -14,6 +14,7 @@ export const ScoringConfig = {
     manualReview: 50,  // score 50-74 → flagged_for_review
                        // score < 50  → denied
   },
+  
   // Interpretation: ±10% in EITHER direction
   // documented_income is acceptable if it falls within
   // [stated * 0.90, stated * 1.10]

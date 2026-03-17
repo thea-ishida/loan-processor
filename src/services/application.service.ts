@@ -10,15 +10,11 @@ import {
   Application,
 } from "../models/application.model";
 
-// ─────────────────────────────────────────────
-// Submit a new application
-// Handles: duplicate check, scoring, state transitions, DB save
-// ─────────────────────────────────────────────
+type ReviewAction = "approved" | "denied" | "partially_approved";
+
 export function submitApplication(input: ApplicationInput): Application {
   const db = getDb();
 
-  // 1. DUPLICATE CHECK
-  // Same email + loan_amount within configured time window = duplicate
   const windowMinutes = ScoringConfig.duplicateWindowMinutes;
   const windowStart = new Date(
     Date.now() - windowMinutes * 60 * 1000
@@ -38,15 +34,12 @@ export function submitApplication(input: ApplicationInput): Application {
     throw new DuplicateApplicationError(existing.id);
   }
 
-  // 2. SCORE THE APPLICATION
   const scoreBreakdown = scoreApplication(input);
   const decision = getDecisionFromScore(scoreBreakdown.total);
 
-  // 3. BUILD THE APPLICATION OBJECT
   const now = new Date().toISOString();
   const id = uuidv4();
 
-  // State machine: submitted → processing → decision
   let status: ApplicationStatus = "submitted";
   status = transition(status, "processing");
   status = transition(status, decision);
@@ -64,7 +57,6 @@ export function submitApplication(input: ApplicationInput): Application {
     updated_at: now,
   };
 
-  // 4. SAVE TO DATABASE
   db.prepare(
     `INSERT INTO applications (
       id, status, applicant_name, email, loan_amount,
@@ -88,7 +80,6 @@ export function submitApplication(input: ApplicationInput): Application {
     now
   );
 
-  // 5. WRITE AUDIT LOG
   writeAuditLog({
     application_id: id,
     event: "application_submitted_and_scored",
@@ -97,7 +88,6 @@ export function submitApplication(input: ApplicationInput): Application {
     metadata: { total_score: scoreBreakdown.total },
   });
 
-  // 6. IF APPROVED → QUEUE DISBURSEMENT
   if (status === "approved") {
     queueDisbursement(id);
   }
@@ -105,12 +95,8 @@ export function submitApplication(input: ApplicationInput): Application {
   return application;
 }
 
-// ─────────────────────────────────────────────
-// Get a single application by ID
-// ─────────────────────────────────────────────
 export function getApplicationById(id: string): Application | null {
   const db = getDb();
-
   const row = db
     .prepare(`SELECT * FROM applications WHERE id = ?`)
     .get(id) as Record<string, unknown> | undefined;
@@ -119,12 +105,8 @@ export function getApplicationById(id: string): Application | null {
   return rowToApplication(row);
 }
 
-// ─────────────────────────────────────────────
-// List applications with optional status filter
-// ─────────────────────────────────────────────
 export function listApplications(status?: string): Application[] {
   const db = getDb();
-
   const rows = status
     ? (db
         .prepare(`SELECT * FROM applications WHERE status = ? ORDER BY created_at DESC`)
@@ -136,12 +118,9 @@ export function listApplications(status?: string): Application[] {
   return rows.map(rowToApplication);
 }
 
-// ─────────────────────────────────────────────
-// Admin review: approve / deny / partially_approve
-// ─────────────────────────────────────────────
 export function reviewApplication(
   id: string,
-  action: "approved" | "denied" | "partially_approved",
+  action: ReviewAction,
   note: string,
   approvedAmount?: number
 ): Application {
@@ -150,7 +129,6 @@ export function reviewApplication(
   const app = getApplicationById(id);
   if (!app) throw new Error(`Application ${id} not found`);
 
-  // Enforce state machine transition
   const newStatus = transition(app.status, action);
   const now = new Date().toISOString();
 
@@ -158,15 +136,8 @@ export function reviewApplication(
     `UPDATE applications
      SET status = ?, review_note = ?, approved_amount = ?, updated_at = ?
      WHERE id = ?`
-  ).run(
-    newStatus,
-    note,
-    approvedAmount ?? null,
-    now,
-    id
-  );
+  ).run(newStatus, note, approvedAmount ?? null, now, id);
 
-  // Write audit log
   writeAuditLog({
     application_id: id,
     event: "admin_review",
@@ -175,17 +146,18 @@ export function reviewApplication(
     metadata: { note, approved_amount: approvedAmount },
   });
 
-  // If approved or partially_approved → queue disbursement
   if (newStatus === "approved" || newStatus === "partially_approved") {
     queueDisbursement(id);
   }
 
-  return getApplicationById(id)!;
+  return getApplicationById(id) as Application;
 }
 
-// ─────────────────────────────────────────────
-// Queue disbursement after approval
-// ─────────────────────────────────────────────
+
+
+
+
+
 export function queueDisbursement(applicationId: string): void {
   const db = getDb();
   const app = getApplicationById(applicationId);
@@ -207,9 +179,6 @@ export function queueDisbursement(applicationId: string): void {
   });
 }
 
-// ─────────────────────────────────────────────
-// Write an audit log entry
-// ─────────────────────────────────────────────
 export function writeAuditLog(params: {
   application_id: string;
   event: string;
@@ -220,7 +189,6 @@ export function writeAuditLog(params: {
   metadata?: Record<string, unknown>;
 }): void {
   const db = getDb();
-
   db.prepare(
     `INSERT INTO audit_log (
       id, application_id, event, from_status, to_status,
@@ -239,19 +207,15 @@ export function writeAuditLog(params: {
   );
 }
 
-// ─────────────────────────────────────────────
-// Get full audit log for an application
-// ─────────────────────────────────────────────
 export function getAuditLog(applicationId: string): unknown[] {
   const db = getDb();
   return db
-    .prepare(`SELECT * FROM audit_log WHERE application_id = ? ORDER BY created_at ASC`)
+    .prepare(
+      `SELECT * FROM audit_log WHERE application_id = ? ORDER BY created_at ASC`
+    )
     .all(applicationId);
 }
 
-// ─────────────────────────────────────────────
-// Helper: convert DB row → Application object
-// ─────────────────────────────────────────────
 function rowToApplication(row: Record<string, unknown>): Application {
   return {
     id: row.id as string,
@@ -266,22 +230,3 @@ function rowToApplication(row: Record<string, unknown>): Application {
     updated_at: row.updated_at as string,
   };
 }
-
-
-/**
- * 
- * User POSTs application
-        ↓
-1. Check for duplicate (same email + amount in last 5 min)
-        ↓
-2. Score it using scoring.service.ts
-        ↓
-3. Run state machine: submitted → processing → approved/denied/flagged
-        ↓
-4. Save to SQLite database
-        ↓
-5. Write audit log entry
-        ↓
-6. If approved → automatically queue disbursement
- * 
- */

@@ -1,3 +1,5 @@
+// makes sure applications can only move through valid states of the project
+
 import { ApplicationStatus } from "../models/application.model";
 import { InvalidStateTransitionError } from "../errors";
 
