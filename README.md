@@ -1,3 +1,73 @@
+## **Project Build & Run Instructions**
+
+#### **Prerequisites**
+- Node.js (v18 or later)
+- npm (v9 or later)
+- SQLite 3
+
+#### **1. Clone the repository**
+```bash
+git clone https://github.com/thea-ishida/loan-processor.git
+cd loan-processor
+
+# 2. Install dependencies
+npm install
+
+# 3. Create a .env file in the project root
+ADMIN_USER=admin
+ADMIN_PASS=secret
+DB_PATH=./data/loan.db
+PORT=3000
+
+# 4. Starting the Application
+npx ts-node src/app.ts
+## or 
+npx nodemon --exec ts-node src/app.ts
+
+## The server will start on 
+http://localhost:3000
+
+
+## **Some Curl Commands for Testing**
+
+#### **Scenario 1 – Jane Doe (Strong financials → Approved)**
+```bash
+curl -X POST http://localhost:3000/applications \
+  -H "Content-Type: application/json" \
+  -d '{
+    "applicant_name": "Jane Doe",
+    "email": "jane.doe@example.com",
+    "loan_amount": 1500,
+    "stated_monthly_income": 5000,
+    "employment_status": "employed",
+    "documented_monthly_income": 4800,
+    "bank_ending_balance": 2300,
+    "bank_has_overdrafts": false,
+    "bank_has_consistent_deposits": true,
+    "monthly_withdrawals": 1200,
+    "monthly_deposits": 4000
+  }'
+
+#### **Scenario 2 – Bob Smith(Weak → Deny)**
+
+curl -X POST http://localhost:3000/applications \
+  -H "Content-Type: application/json" \
+  -d '{
+    "applicant_name": "Bob Smith",
+    "email": "bob.smith@example.com",
+    "loan_amount": 2000,
+    "stated_monthly_income": 1400,
+    "employment_status": "self-employed",
+    "documented_monthly_income": 1350,
+    "bank_ending_balance": 1500,
+    "bank_has_overdrafts": true,
+    "bank_has_consistent_deposits": false,
+    "monthly_withdrawals": 1100,
+    "monthly_deposits": 1350
+  }'
+
+
+
 # Architecture Overview
 The project follows a Controller-Service-Repository pattern to ensure a clean separation of concerns.
 * **Routes/Controllers**: Handle HTTP parsing and validation of JSON input.
