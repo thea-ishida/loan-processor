@@ -1,39 +1,59 @@
-## **Project Build & Run Instructions**
+# Loan Processor
 
-#### **Prerequisites**
-- Node.js (v18 or later)
-- npm (v9 or later)
-- SQLite 3
+## Table of Contents
+- [Getting Started](#getting-started)
+- [Testing with Curl](#testing-with-curl)
+- [Architecture Overview](#architecture-overview)
+- [Database Design](#database-design)
+- [State Machine Design](#state-machine-design)
+- [Scoring Explanation](#scoring-explanation)
+- [Webhook Flow and Idempotency](#webhook-flow-and-idempotency)
+- [Duplicate Prevention](#duplicate-prevention)
+- [API Endpoints](#api-endpoints)
+- [Tradeoffs and Assumptions](#tradeoffs-and-assumptions)
 
-#### **1. Clone the repository**
-```bash
+---
+
+## Getting Started
+
+### 1. Clone the Repository
+ash
 git clone https://github.com/thea-ishida/loan-processor.git
 cd loan-processor
 
-# 2. Install dependencies
+### 2. Install Dependencies
+ash
 npm install
 
-# 3. Create a .env file in the project root
+
+### 3. Create a `.env` File in the Project Root
+nv
 ADMIN_USER=admin
 ADMIN_PASS=secret
 DB_PATH=./data/loan.db
 PORT=3000
 
-# 4. Starting the Application
+
+### 4. Start the Application
+ash
 npx ts-node src/app.ts
-## or 
+
+
+or
+
 npx nodemon --exec ts-node src/app.ts
 
-## The server will start on 
-http://localhost:3000
 
+The server will start on `http://localhost:3000`
 
-## **Some Curl Commands for Testing**
+---
 
-#### **Scenario 1 – Jane Doe (Strong financials → Approved)**
-```bash
-curl -X POST http://localhost:3000/applications \
-  -H "Content-Type: application/json" \
+## Testing with Curl
+
+### Scenario 1 – Jane Doe (Strong Financials → Approved)
+ash
+curl -X POST http://localhost:3000/applications 
+  -H "Content-Type: application/json" 
   -d '{
     "applicant_name": "Jane Doe",
     "email": "jane.doe@example.com",
@@ -48,10 +68,11 @@ curl -X POST http://localhost:3000/applications \
     "monthly_deposits": 4000
   }'
 
-#### **Scenario 2 – Bob Smith(Weak → Deny)**
 
-curl -X POST http://localhost:3000/applications \
-  -H "Content-Type: application/json" \
+### Scenario 2 – Bob Smith (Weak Financials → Denied)
+ash
+curl -X POST http://localhost:3000/applications 
+  -H "Content-Type: application/json" 
   -d '{
     "applicant_name": "Bob Smith",
     "email": "bob.smith@example.com",
@@ -67,107 +88,269 @@ curl -X POST http://localhost:3000/applications \
   }'
 
 
+---
 
-# Architecture Overview
-The project follows a Controller-Service-Repository pattern to ensure a clean separation of concerns.
-* **Routes/Controllers**: Handle HTTP parsing and validation of JSON input.
-* **Services**: Contain core business logic, including the scoring engine and disbursement layer.
-* **State Machine**: A dedicated, enforced transition layer that prevents invalid status changes.
-* **Database**: SQLite is used for zero-friction setup, utilizing the schema provided in the technical requirements.
-### **Database Design**
+## Architecture Overview
 
-The database layer uses **four tables**, each serving a distinct purpose in maintaining data integrity, auditability, and idempotency:
+The project follows a **Controller-Service-Repository** pattern to ensure a clean separation of concerns.
 
-1. **`applications`**  
-   Stores all loan application data, including applicant details, loan amount, income verification, and current application status.  
-   This is the core business table that drives the state machine.
-
-2. **`audit_logs`**  
-   Records every state transition and significant event for each application.  
-   This provides a complete audit trail, ensuring traceability and compliance — no state change occurs without being logged.
-
-3. **`disbursement_attempts`**  
-   Tracks each outbound disbursement attempt.  
-   Each retry generates a unique `retry_id`, allowing Finance to see every attempt while maintaining idempotency through a shared `transaction_id`.  
-   After three failed attempts, the system automatically escalates the application to `flagged_for_review`.
-
-4. **`webhook_events`**  
-   Logs all incoming callbacks from the external payment provider.  
-   Each webhook is stored with its `transaction_id` and payload to ensure **idempotency** — duplicate webhooks are recognized and ignored while still being recorded for transparency.
-
-Together, these four tables separate **business logic (`applications`)** from **system reliability (`disbursement_attempts`, `webhook_events`)** and **compliance tracking (`audit_logs`)**.  
-This design ensures the system is both **fault-tolerant** and **fully auditable**.
+- **Routes/Controllers** — Handle HTTP parsing and validation of JSON input.
+- **Services** — Contain core business logic, including the scoring engine and disbursement layer.
+- **State Machine** — A dedicated, enforced transition layer that prevents invalid status changes.
+- **Database** — SQLite is used for zero-friction setup, utilizing the schema provided in the technical requirements.
 
 ---
 
-# State Machine Design
+## Database Design
+
+The database layer uses **four tables**, each serving a distinct purpose in maintaining data integrity, auditability, and idempotency.
+
+### `applications`
+Stores all loan application data, including applicant details, loan amount, income verification, and current application status. This is the core business table that drives the state machine.
+
+### `audit_logs`
+Records every state transition and significant event for each application. This provides a complete audit trail, ensuring traceability and compliance — no state change occurs without being logged.
+
+### `disbursement_attempts`
+Tracks each outbound disbursement attempt. Each retry generates a unique `retry_id`, allowing Finance to see every attempt while maintaining idempotency through a shared `transaction_id`. After three failed attempts, the system automatically escalates the application to `flagged_for_review`.
+
+### `webhook_events`
+Logs all incoming callbacks from the external payment provider. Each webhook is stored with its `transaction_id` and payload to ensure idempotency — duplicate webhooks are recognized and ignored while still being recorded for transparency.
+
+Together, these four tables separate **business logic** (`applications`) from **system reliability** (`disbursement_attempts`, `webhook_events`) and **compliance tracking** (`audit_logs`). This design ensures the system is both fault-tolerant and fully auditable.
+
+---
+
+## State Machine Design
+
 The state machine is enforced, not just tracked. Any attempt to bypass a valid flow throws a typed `InvalidStateTransitionError`.
 
-### Valid Transitions:
-* **submitted** -> **processing**
-* **processing** -> **approved** | **denied** | **flagged_for_review**
-* **approved** -> **disbursement_queued**
-* **disbursement_queued** -> **disbursed** | **disbursement_failed**
-* **disbursement_failed** -> **disbursement_queued** (Automatic Retry)
-* **flagged_for_review** -> **approved** | **denied** | **partially_approved**
+### Valid Transitions
 
-### Mid-Spec Migration: partially_approved
+| From | To |
+| :--- | :--- |
+| `submitted` | `processing` |
+| `processing` | `approved` \| `denied` \| `flagged_for_review` |
+| `approved` | `disbursement_queued` |
+| `disbursement_queued` | `disbursed` \| `disbursement_failed` |
+| `disbursement_failed` | `disbursement_queued` *(automatic retry)* |
+| `flagged_for_review` | `approved` \| `denied` \| `partially_approved` |
+
+### Mid-Spec Addition: `partially_approved`
+
 To accommodate the product request for reduced loan amounts, a `partially_approved` state was added. It slots between `flagged_for_review` and `disbursement_queued`, allowing reviewers to specify a `reduced_loan_amount`.
 
 ---
 
-# Scoring Explanation
+## Scoring Explanation
+
 ### Decision Thresholds
-Weights and thresholds are managed via `ScoringConfig` to avoid hardcoding:
-* **Score >= 75**: Auto-approve
-* **Score 50-74**: Flag for manual review
-* **Score < 50**: Auto-deny
+
+Weights and thresholds are managed via `ScoringConfig` to avoid hardcoding.
+
+| Score Range | Decision |
+| :--- | :--- |
+| >= 75 | Auto-approve |
+| 50 – 74 | Flag for manual review |
+| < 50 | Auto-deny |
 
 ### Income Verification: The 10% Tolerance
-**Interpretation**: Asymmetric Lower-Bound Only.
-* **The Rule**: An applicant fails this check only if their documented income is more than 10% below their stated income.
-* **The Reasoning**: Real-world applicants typically quote primary salary, while bank statements often capture additional income like bonuses or overtime. Penalizing an applicant for having higher documented income than stated does not align with credit risk perspectives.
+
+**Interpretation**: Asymmetric lower-bound only.
+
+- **The Rule** — An applicant fails this check only if their documented income is more than 10% below their stated income.
+- **The Reasoning** — Real-world applicants typically quote primary salary, while bank statements often capture additional income like bonuses or overtime. Penalizing an applicant for having higher documented income than stated does not align with credit risk perspectives.
 
 ---
 
-# Webhook Flow and Idempotency
-### The Tradeoff: Retry Idempotency vs. Audit Trail
-**The Conflict**: Product wants 3 auto-retries on failure, but Finance requires a unique audit record for every single attempt.
+## Webhook Flow and Idempotency
 
-**The Solution**: We separate Transaction Identity from Retry Identity:
-1. **transaction_id (External)**: Provided by the payment system. If we receive the same `transaction_id` twice, it is treated as a replay. We log the receipt in the audit log but make no state changes.
-2. **retry_id (Internal)**: Our system generates a unique UUID for every new disbursement attempt triggered after a failure.
-3. **disbursement_attempts Table**: Stores every unique attempt with its own `retry_id`, `attempt_number`, and timestamp, satisfying Finance requirements.
+### The Tradeoff: Retry Idempotency vs. Audit Trail
+
+**The Conflict** — Product wants 3 auto-retries on failure, but Finance requires a unique audit record for every single attempt.
+
+**The Solution** — We separate transaction identity from retry identity.
+
+1. **`transaction_id` (External)** — Provided by the payment system. If the same `transaction_id` is received twice, it is treated as a replay. The receipt is logged in the audit log but no state changes are made.
+2. **`retry_id` (Internal)** — Our system generates a unique UUID for every new disbursement attempt triggered after a failure.
+3. **`disbursement_attempts` Table** — Stores every unique attempt with its own `retry_id`, `attempt_number`, and timestamp, satisfying Finance requirements.
 
 ### Timeout Handling
+
 A background poller checks for applications stuck in `disbursement_queued` longer than the configured timeout and moves them to `flagged_for_review`.
 
 ---
 
-# Duplicate Prevention and Idempotency
-* **Duplicate Check**: Submissions with the same Email + Loan Amount within a 5-minute window are rejected. The response returns a `DuplicateApplicationError` and the original application ID.
-* **Webhook Replay**: Replayed webhooks are idempotent based on the `transaction_id`, ensuring no duplicate state transitions occur.
+## Duplicate Prevention
+
+- **Duplicate Check** — Submissions with the same email and loan amount within a 5-minute window are rejected. The response returns a `DuplicateApplicationError` and the original application ID.
+- **Webhook Replay** — Replayed webhooks are idempotent based on the `transaction_id`, ensuring no duplicate state transitions occur.
 
 ---
 
-# API Endpoints
+## API Endpoints
+
 ### Application Endpoints
-* **POST /applications**: Submit a new loan application.
 
-### Admin Endpoints (Basic Auth)
-* **GET /admin/applications?status=flagged_for_review**: List filtered applications.
-* **GET /admin/applications/:id**: View full detail including score breakdown.
-* **POST /admin/applications/:id/review**: Approve, deny, or partially_approve with a note.
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/applications` | Submit a new loan application |
 
-### Webhook Endpoint
-* **POST /webhook/disbursement**: Asynchronous callback for disbursement results.
+### Admin Endpoints *(Basic Auth Required)*
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/admin/applications?status=flagged_for_review` | List filtered applications |
+| `GET` | `/admin/applications/:id` | View full detail including score breakdown |
+| `POST` | `/admin/applications/:id/review` | Approve, deny, or partially approve with a note |
+
+### Webhook Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/webhook/disbursement` | Asynchronous callback for disbursement results |
 
 ---
 
-# Tradeoffs and Assumptions
+## Tradeoffs and Assumptions
+
 | Decision | Tradeoff |
 | :--- | :--- |
 | **SQLite over PostgreSQL** | Chosen for zero-setup friction in a local environment; not suitable for concurrent production loads. |
-| **Null Bank Data Score 0** | Incomplete applications should not receive the benefit of the doubt on missing data. |
-| **Asymmetric Tolerance** | Prioritizes fairness for conservative self-reporters over a strict symmetric match. |
+| **Null Bank Data Scores 0** | Incomplete applications should not receive the benefit of the doubt on missing data. |
+| **Asymmetric Income Tolerance** | Prioritizes fairness for conservative self-reporters over a strict symmetric match. |
+| **Binary Income Score (0/100)** | Simple and auditable; avoids unrequested complexity. |
+
+
+---
+
+## Architecture Overview
+
+The project follows a **Controller-Service-Repository** pattern to ensure a clean separation of concerns.
+
+- **Routes/Controllers** — Handle HTTP parsing and validation of JSON input.
+- **Services** — Contain core business logic, including the scoring engine and disbursement layer.
+- **State Machine** — A dedicated, enforced transition layer that prevents invalid status changes.
+- **Database** — SQLite is used for zero-friction setup, utilizing the schema provided in the technical requirements.
+
+---
+
+## Database Design
+
+The database layer uses **four tables**, each serving a distinct purpose in maintaining data integrity, auditability, and idempotency.
+
+### `applications`
+Stores all loan application data, including applicant details, loan amount, income verification, and current application status. This is the core business table that drives the state machine.
+
+### `audit_logs`
+Records every state transition and significant event for each application. This provides a complete audit trail, ensuring traceability and compliance — no state change occurs without being logged.
+
+### `disbursement_attempts`
+Tracks each outbound disbursement attempt. Each retry generates a unique `retry_id`, allowing Finance to see every attempt while maintaining idempotency through a shared `transaction_id`. After three failed attempts, the system automatically escalates the application to `flagged_for_review`.
+
+### `webhook_events`
+Logs all incoming callbacks from the external payment provider. Each webhook is stored with its `transaction_id` and payload to ensure idempotency — duplicate webhooks are recognized and ignored while still being recorded for transparency.
+
+Together, these four tables separate **business logic** (`applications`) from **system reliability** (`disbursement_attempts`, `webhook_events`) and **compliance tracking** (`audit_logs`). This design ensures the system is both fault-tolerant and fully auditable.
+
+---
+
+## State Machine Design
+
+The state machine is enforced, not just tracked. Any attempt to bypass a valid flow throws a typed `InvalidStateTransitionError`.
+
+### Valid Transitions
+
+| From | To |
+| :--- | :--- |
+| `submitted` | `processing` |
+| `processing` | `approved` \| `denied` \| `flagged_for_review` |
+| `approved` | `disbursement_queued` |
+| `disbursement_queued` | `disbursed` \| `disbursement_failed` |
+| `disbursement_failed` | `disbursement_queued` *(automatic retry)* |
+| `flagged_for_review` | `approved` \| `denied` \| `partially_approved` |
+
+### Mid-Spec Addition: `partially_approved`
+
+To accommodate the product request for reduced loan amounts, a `partially_approved` state was added. It slots between `flagged_for_review` and `disbursement_queued`, allowing reviewers to specify a `reduced_loan_amount`.
+
+---
+
+## Scoring Explanation
+
+### Decision Thresholds
+
+Weights and thresholds are managed via `ScoringConfig` to avoid hardcoding.
+
+| Score Range | Decision |
+| :--- | :--- |
+| >= 75 | Auto-approve |
+| 50 – 74 | Flag for manual review |
+| < 50 | Auto-deny |
+
+### Income Verification: The 10% Tolerance
+
+**Interpretation**: Asymmetric lower-bound only.
+
+- **The Rule** — An applicant fails this check only if their documented income is more than 10% below their stated income.
+- **The Reasoning** — Real-world applicants typically quote primary salary, while bank statements often capture additional income like bonuses or overtime. Penalizing an applicant for having higher documented income than stated does not align with credit risk perspectives.
+
+---
+
+## Webhook Flow and Idempotency
+
+### The Tradeoff: Retry Idempotency vs. Audit Trail
+
+**The Conflict** — Product wants 3 auto-retries on failure, but Finance requires a unique audit record for every single attempt.
+
+**The Solution** — We separate transaction identity from retry identity.
+
+1. **`transaction_id` (External)** — Provided by the payment system. If the same `transaction_id` is received twice, it is treated as a replay. The receipt is logged in the audit log but no state changes are made.
+2. **`retry_id` (Internal)** — Our system generates a unique UUID for every new disbursement attempt triggered after a failure.
+3. **`disbursement_attempts` Table** — Stores every unique attempt with its own `retry_id`, `attempt_number`, and timestamp, satisfying Finance requirements.
+
+### Timeout Handling
+
+A background poller checks for applications stuck in `disbursement_queued` longer than the configured timeout and moves them to `flagged_for_review`.
+
+---
+
+## Duplicate Prevention
+
+- **Duplicate Check** — Submissions with the same email and loan amount within a 5-minute window are rejected. The response returns a `DuplicateApplicationError` and the original application ID.
+- **Webhook Replay** — Replayed webhooks are idempotent based on the `transaction_id`, ensuring no duplicate state transitions occur.
+
+---
+
+## API Endpoints
+
+### Application Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/applications` | Submit a new loan application |
+
+### Admin Endpoints *(Basic Auth Required)*
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/admin/applications?status=flagged_for_review` | List filtered applications |
+| `GET` | `/admin/applications/:id` | View full detail including score breakdown |
+| `POST` | `/admin/applications/:id/review` | Approve, deny, or partially approve with a note |
+
+### Webhook Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/webhook/disbursement` | Asynchronous callback for disbursement results |
+
+---
+
+## Tradeoffs and Assumptions
+
+| Decision | Tradeoff |
+| :--- | :--- |
+| **SQLite over PostgreSQL** | Chosen for zero-setup friction in a local environment; not suitable for concurrent production loads. |
+| **Null Bank Data Scores 0** | Incomplete applications should not receive the benefit of the doubt on missing data. |
+| **Asymmetric Income Tolerance** | Prioritizes fairness for conservative self-reporters over a strict symmetric match. |
 | **Binary Income Score (0/100)** | Simple and auditable; avoids unrequested complexity. |
