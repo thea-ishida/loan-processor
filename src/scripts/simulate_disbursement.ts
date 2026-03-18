@@ -3,15 +3,15 @@ import http from 'http';
 
 /**
  * WEBHOOK SIMULATOR SCRIPT
- * Purpose: Demonstrates Happy Path, Failure/Retry logic, and Idempotency[cite: 280, 294].
+ * Purpose: Demonstrates Happy Path, Failure/Retry logic, and Idempotency.
  * Requirements: 
- * 1. Success -> disbursed [cite: 271, 272]
- * 2. Failure -> disbursement_failed (retryable) [cite: 273]
- * 3. Replay -> Idempotent (no state change) [cite: 274, 283]
+ * 1. Success -> disbursed 
+ * 2. Failure -> disbursement_failed (retryable) 
+ * 3. Replay -> Idempotent (no state change) 
  */
 
 const API_URL = 'http://localhost:3000/webhook/disbursement';
-const APPLICATION_ID = 'e4063d5e-77ac-47c7-9587-97377c6ca7a9'; // Use your specific test ID
+const APPLICATION_ID = 'e4063d5e-77ac-47c7-9587-97377c6ca7a9'; // Use your specific test ID for testing
 
 interface WebhookPayload {
   application_id: string;
