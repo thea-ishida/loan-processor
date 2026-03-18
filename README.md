@@ -4,6 +4,29 @@ The project follows a Controller-Service-Repository pattern to ensure a clean se
 * **Services**: Contain core business logic, including the scoring engine and disbursement layer.
 * **State Machine**: A dedicated, enforced transition layer that prevents invalid status changes.
 * **Database**: SQLite is used for zero-friction setup, utilizing the schema provided in the technical requirements.
+### **Database Design**
+
+The database layer uses **four tables**, each serving a distinct purpose in maintaining data integrity, auditability, and idempotency:
+
+1. **`applications`**  
+   Stores all loan application data, including applicant details, loan amount, income verification, and current application status.  
+   This is the core business table that drives the state machine.
+
+2. **`audit_logs`**  
+   Records every state transition and significant event for each application.  
+   This provides a complete audit trail, ensuring traceability and compliance — no state change occurs without being logged.
+
+3. **`disbursement_attempts`**  
+   Tracks each outbound disbursement attempt.  
+   Each retry generates a unique `retry_id`, allowing Finance to see every attempt while maintaining idempotency through a shared `transaction_id`.  
+   After three failed attempts, the system automatically escalates the application to `flagged_for_review`.
+
+4. **`webhook_events`**  
+   Logs all incoming callbacks from the external payment provider.  
+   Each webhook is stored with its `transaction_id` and payload to ensure **idempotency** — duplicate webhooks are recognized and ignored while still being recorded for transparency.
+
+Together, these four tables separate **business logic (`applications`)** from **system reliability (`disbursement_attempts`, `webhook_events`)** and **compliance tracking (`audit_logs`)**.  
+This design ensures the system is both **fault-tolerant** and **fully auditable**.
 
 ---
 
