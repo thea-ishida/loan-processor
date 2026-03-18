@@ -22,24 +22,39 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
   message: string;
   application_id: string;
   new_status: string;
-} {
+  replay: boolean;
+}
+ {
   const db = getDb();
   const { application_id, status, transaction_id, timestamp } = payload;
+  const raw_payload = JSON.stringify(payload);
+  const received_at = new Date().toISOString();
 
+   // ─────────────────────────────────────────────────────────────────
   // 1. IDEMPOTENCY CHECK
-  // If we've seen this transaction_id before → return silently, no state change
+  //
+  // webhook_events has a UNIQUE index on transaction_id, so if the
+  // same transaction_id arrives again it's a replay.
+  //
+  // We do NOT insert another webhook_events row for a replay (the
+  // unique constraint would reject it anyway). Instead we log the
+  // replay in audit_logs only, and return the current app state.
+  // ─────────────────────────────────────────────────────────────────
   const alreadyProcessed = db
-    .prepare(`SELECT transaction_id FROM webhook_events WHERE transaction_id = ?`)
-    .get(transaction_id) as { transaction_id: string } | undefined;
+    .prepare(`SELECT id FROM webhook_events WHERE transaction_id = ? LIMIT 1`)
+    .get(transaction_id) as { id: string } | undefined;
 
   if (alreadyProcessed) {
-    // This is a replay — spec says idempotent, not an error
-    // We log it for audit trail but do NOT change state
     writeAuditLog({
       application_id,
       event: "webhook_replay_ignored",
-      transaction_id,
-      metadata: { reason: "transaction_id already processed", timestamp },
+      triggered_by: "webhook",
+      metadata: {
+        reason: "transaction_id already processed — idempotent no-op",
+        transaction_id,
+        original_event_id: alreadyProcessed.id,
+        timestamp,
+      },
     });
 
     const app = getApplicationById(application_id);
@@ -47,8 +62,10 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
       message: "Webhook already processed — idempotent no-op",
       application_id,
       new_status: app?.status ?? "unknown",
+      replay: true,
     };
   }
+
 
   // 2. GET THE APPLICATION
   const app = getApplicationById(application_id);
@@ -68,74 +85,124 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
       `UPDATE applications SET status = ?, updated_at = ? WHERE id = ?`
     ).run(newStatus, now, application_id);
 
-    // Mark transaction as processed (idempotency key)
-    db.prepare(
-      `INSERT INTO webhook_events (transaction_id, application_id, status, processed_at)
-       VALUES (?, ?, ?, ?)`
-    ).run(transaction_id, application_id, "success", now);
+    // Record in webhook_events (transaction_id is the idempotency key)
+    db.prepare(`
+      INSERT INTO webhook_events
+        (id, transaction_id, application_id, status, payload_json, is_replay, received_at)
+      VALUES (?, ?, ?, ?, ?, 0, ?)
+    `).run(
+      uuidv4(),
+      transaction_id,
+      application_id,
+      "success",
+      raw_payload,
+      received_at
+    );
 
-    // Audit log
+     // Record in disbursement_attempts
+    // retry_id is unique per delivery — satisfies finance team audit requirement
+    const retryId = uuidv4();
+    const attemptNumber = (app.retry_count ?? 0) + 1;
+
+    db.prepare(`
+      INSERT INTO disbursement_attempts
+        (id, application_id, retry_id, attempt_number, transaction_id, status, created_at, resolved_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      uuidv4(),
+      application_id,
+      retryId,
+      attemptNumber,
+      transaction_id,
+      "success",
+      received_at,
+      now
+    );
+
     writeAuditLog({
       application_id,
       event: "disbursement_succeeded",
       from_status: app.status,
       to_status: newStatus,
-      transaction_id,
-      metadata: { timestamp },
+      triggered_by: "webhook",
+      metadata: {
+        retry_id: retryId,
+        transaction_id,
+        attempt_number: attemptNumber,
+        timestamp,
+      },
     });
 
+  // ─────────────────────────────────────────────────────────────────
+  // 4. FAILURE PATH — disbursement_queued → disbursement_failed
+  //
+  // Key design decision:
+  //   transaction_id  = idempotency key (same txn replayed = no-op)
+  //   retry_id        = unique UUID per delivery attempt, stored in
+  //                     disbursement_attempts for finance team audit
+  //
+  // Each failure gets its own retry_id, satisfying the finance
+  // requirement of a distinct audit record per retry, while the
+  // transaction_id uniqueness in webhook_events ensures replays
+  // of the same payment event never mutate state twice.
+  // ─────────────────────────────────────────────────────────────────
   } else {
-    // FAILURE PATH: disbursement_queued → disbursement_failed
     newStatus = transition(app.status, "disbursement_failed");
-    const currentRetryCount = app.retry_count + 1;
+    const currentRetryCount = (app.retry_count ?? 0) + 1;
+
+    // Unique retry_id per failure attempt — finance team audit trail
+    const retryId = uuidv4();
 
     db.prepare(
       `UPDATE applications SET status = ?, retry_count = ?, updated_at = ? WHERE id = ?`
     ).run(newStatus, currentRetryCount, now, application_id);
 
-    
-    const id = uuidv4();
-    const payload_json = JSON.stringify(payload);
-    const is_replay = 0;
-    const received_at = new Date().toISOString();
-
+    // Record in webhook_events
     db.prepare(`
-    INSERT INTO webhook_events (
-        id, transaction_id, application_id, status, payload_json, is_replay, received_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO webhook_events
+        (id, transaction_id, application_id, status, payload_json, is_replay, received_at)
+      VALUES (?, ?, ?, ?, ?, 0, ?)
     `).run(
-    id,
-    transaction_id,
-    application_id,
-    "failed", // or "success" depending on the webhook outcome
-    payload_json,
-    is_replay,
-    received_at
+      uuidv4(),
+      transaction_id,
+      application_id,
+      "failed",
+      raw_payload,
+      received_at
+    );
+      // Record in disbursement_attempts with unique retry_id
+    db.prepare(`
+      INSERT INTO disbursement_attempts
+        (id, application_id, retry_id, attempt_number, transaction_id, status, created_at, resolved_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      uuidv4(),
+      application_id,
+      retryId,
+      currentRetryCount,
+      transaction_id,
+      "failed",
+      received_at,
+      now
     );
 
-    // Each retry gets a UNIQUE retry_id for the finance team audit trail
-    // This reconciles: same transaction = idempotent, each retry = distinct audit record
-    const retryId = uuidv4();
-
-    writeAuditLog({
+     writeAuditLog({
       application_id,
       event: "disbursement_failed",
       from_status: app.status,
       to_status: newStatus,
-      transaction_id,
+      triggered_by: "webhook",
       metadata: {
+        retry_id: retryId,
+        transaction_id,
         retry_count: currentRetryCount,
         timestamp,
       },
     });
 
-    // AUTO-RETRY LOGIC
-    // Product team: auto-retry up to maxRetryAttempts before escalating
+     // ── AUTO-RETRY OR ESCALATE ────────────────────────────────────
     if (currentRetryCount < ScoringConfig.maxRetryAttempts) {
-      // Re-queue for retry
       const requeued = transition(newStatus as any, "disbursement_queued");
-      const requeueRetryId = uuidv4();
 
       db.prepare(
         `UPDATE applications SET status = ?, updated_at = ? WHERE id = ?`
@@ -146,7 +213,9 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
         event: "disbursement_requeued_for_retry",
         from_status: newStatus,
         to_status: requeued,
+        triggered_by: "system",
         metadata: {
+          retry_id: retryId,
           retry_count: currentRetryCount,
           max_retries: ScoringConfig.maxRetryAttempts,
         },
@@ -155,7 +224,7 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
       newStatus = requeued;
 
     } else {
-      // MAX RETRIES EXCEEDED → escalate to manual review
+      // Max retries exceeded → escalate
       const escalated = "flagged_for_review";
 
       db.prepare(
@@ -167,7 +236,9 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
         event: "disbursement_escalated_to_manual_review",
         from_status: newStatus,
         to_status: escalated,
+        triggered_by: "system",
         metadata: {
+          retry_id: retryId,
           reason: `Failed ${currentRetryCount} times, exceeded max ${ScoringConfig.maxRetryAttempts}`,
         },
       });
@@ -180,13 +251,13 @@ export function handleDisbursementWebhook(payload: WebhookPayload): {
     message: `Webhook processed: ${status}`,
     application_id,
     new_status: newStatus,
+    replay: false,
   };
 }
 
+
 // ─────────────────────────────────────────────
 // Timeout checker: runs periodically
-// Applications in disbursement_queued with no webhook
-// after timeout → flag for manual review
 // ─────────────────────────────────────────────
 export function checkDisbursementTimeouts(): void {
   const db = getDb();
@@ -195,7 +266,6 @@ export function checkDisbursementTimeouts(): void {
     Date.now() - timeoutMinutes * 60 * 1000
   ).toISOString();
 
-  // Find all apps still queued past the timeout window
   const timedOut = db
     .prepare(
       `SELECT id, status FROM applications
@@ -215,6 +285,7 @@ export function checkDisbursementTimeouts(): void {
       event: "disbursement_timeout_flagged",
       from_status: "disbursement_queued",
       to_status: "flagged_for_review",
+      triggered_by: "system",
       metadata: {
         reason: `No webhook received within ${timeoutMinutes} minutes`,
         timeout_cutoff: cutoff,

@@ -159,8 +159,8 @@ export function queueDisbursement(applicationId: string): void {
   const app = getApplicationById(applicationId);
   if (!app) return;
 
-  transition(app.status, "disbursement_queued");
-  const newStatus = "approved";
+  // FIX: Transition to 'disbursement_queued', not back to 'approved'
+  const newStatus = transition(app.status, "disbursement_queued"); 
   const now = new Date().toISOString();
 
   db.prepare(
@@ -171,7 +171,8 @@ export function queueDisbursement(applicationId: string): void {
     application_id: applicationId,
     event: "disbursement_queued",
     from_status: app.status,
-    to_status: "disbursement_queued",
+    to_status: newStatus,
+    triggered_by: "system",
     metadata: {},
   });
 }
@@ -181,24 +182,31 @@ export function writeAuditLog(params: {
   event: string;
   from_status?: string;
   to_status?: string;
-  triggered_by?: string;        // maps to triggered_by column
-  transaction_id?: string;
+  triggered_by?: string;
+  transaction_id?: string; 
   metadata?: Record<string, unknown>;
 }): void {
   const db = getDb();
-  db.prepare(
-    `INSERT INTO audit_logs (
+  
+  // Merge transaction_id into metadata if you don't have a dedicated column
+  const finalMetadata = {
+    ...params.metadata,
+    ...(params.transaction_id ? { transaction_id: params.transaction_id } : {}),
+  };
+
+  db.prepare(`
+    INSERT INTO audit_logs (
       id, application_id, event_type, from_status, to_status, triggered_by, event_data_json, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    uuidv4(),                                 // id          TEXT PRIMARY KEY
-    params.application_id,                    // application_id TEXT NOT NULL
-    params.event,                             // event_type  TEXT NOT NULL
-    params.from_status ?? null,               // from_status TEXT
-    params.to_status ?? null,                 // to_status   TEXT
-    params.triggered_by ?? "system",          // triggered_by TEXT NOT NULL  ← never null
-    JSON.stringify(params.metadata ?? {}),    // event_data_json TEXT
-    new Date().toISOString()                  // created_at  TEXT NOT NULL
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    uuidv4(),
+    params.application_id,
+    params.event,
+    params.from_status ?? null,
+    params.to_status ?? null,
+    params.triggered_by ?? "system",
+    JSON.stringify(finalMetadata), // Using the merged metadata here
+    new Date().toISOString()
   );
 }
 
