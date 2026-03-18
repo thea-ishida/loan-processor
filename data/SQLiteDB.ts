@@ -1,3 +1,6 @@
+
+// for testing purposes only - creates a SQLite database with sample applications and webhook events
+
 import Database from 'better-sqlite3';
 import { PathLike } from 'fs';
 import path from 'path';
