@@ -1,5 +1,7 @@
 # Loan Processor
 
+A TypeScript + Node.js backend developed for a fin-tech startup as part of a take-home technical assessment. The system handles end-to-end loan application processing — from submission and multi-factor scoring to disbursement and webhook reconciliation — built around a fully enforced state machine, configurable scoring weights, duplicate prevention, idempotent webhook callbacks, and a complete audit trail across four relational tables.
+
 ## Table of Contents
 - [Getting Started](#getting-started)
 - [Testing with Curl](#testing-with-curl)
